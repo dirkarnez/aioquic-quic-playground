@@ -1,0 +1,4 @@
+{
+    "python.defaultInterpreterPath": "${env:USERPROFILE}/Downloads/python-3.13.9-amd64-portable/python.exe",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
+}

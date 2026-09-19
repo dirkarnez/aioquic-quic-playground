@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebTransport 感測器實時儀表板</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }
+        h1 { margin-top: 0; color: #2c3e50; }
+        .status-panel {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            border-radius: 8px;
+            background-color: #f8f9fa;
+            margin-bottom: 20px;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #e74c3c;
+            margin-right: 10px;
+        }
+        .status-dot.connected { background-color: #2ecc71; }
+        .status-text { font-weight: bold; }
+        
+        .data-display {
+            background-color: #1e1e1e;
+            color: #a9b7c6;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Courier New', Courier, monospace;
+            height: 250px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .controls { margin-top: 20px; }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #2980b9; }
+        button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>📡 Sensor CSI Dashboard</h1>
+    
+    <div class="status-panel">
+        <div id="statusDot" class="status-dot"></div>
+        <div id="statusText" class="status-text">未連線 (Disconnected)</div>
+    </div>
+
+    <h3>📥 實時接收感測器數據 (Raw Datagrams)</h3>
+    <div id="dataLog" class="data-display">等待連線中...</div>
+
+    <div class="controls">
+        <button id="connectBtn">連接 WebTransport</button>
+    </div>
+</div>
+
+<script>
+    // ⚠️ 請在此貼上你在「步驟 2」中透過 OpenSSL 生成的 Base64 憑證雜湊值
+    const certHashBase64 = "Gi/HIwdiMcPZo2KBjnstF5kQdLI5bPrYJ8i3Vi6Ybck=";
+
+    const connectBtn = document.getElementById('connectBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const dataLog = document.getElementById('dataLog');
+
+    let transport = null;
+    let reader = null;
+
+    // 將 Base64 字串轉換為 WebTransport 所需的 Uint8Array
+    function base64ToUint8Array(base64) {
+        const raw = window.atob(base64);
+        const rawLength = raw.length;
+        const array = new Uint8Array(new ArrayBuffer(rawLength));
+        for (let i = 0; i < rawLength; i++) {
+            array[i] = raw.charCodeAt(i);
+        }
+        return array;
+    }
+
+    async function initWebTransport() {
+        updateStatus("connecting", "連線中...");
+        connectBtn.disabled = true;
+
+        try {
+            const hashBuffer = base64ToUint8Array(certHashBase64);
+
+            // 初始化連線物件，傳入自簽憑證雜湊以繞過瀏覽器限制
+            transport = new WebTransport("https://localhost:4433", {
+                serverCertificateHashes: [
+                    {
+                        algorithm: "sha-256",
+                        value: hashBuffer
+                    }
+                ]
+            });
+
+            // 等待握手完成
+            await transport.ready;
+            updateStatus("connected", "已成功連接 Python 伺服器 (Port 4433)");
+            logMessage("【系統】WebTransport 通道已建立。正在監聽感測器廣播...");
+
+            // 開始異步讀取不靠譜數據包 (Datagram)
+            listenToDatagrams();
+
+        } catch (error) {
+            console.error("連線錯誤:", error);
+            updateStatus("disconnected", `連線失敗: ${error.message}`);
+            connectBtn.disabled = false;
+        }
+    }
+
+    async function listenToDatagrams() {
+        reader = transport.datagrams.readable.getReader();
+        const decoder = new TextDecoder('utf-8'); // 如果感測器發送的是純文字，可用此解碼
+
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) {
+                    logMessage("【系統】連線已被伺服器關閉。");
+                    break;
+                }
+
+                // 核心修正：Python 端發送時前綴了 b'\x00' (Flow ID)，這裡必須進行切除
+                const rawSensorData = value.slice(1);
+
+                // --- 數據處理邏輯 ---
+                // 方案 A：如果是 ASCII / JSON 字串數據，直接解碼顯示
+                const textData = decoder.decode(rawSensorData);
+                
+                // 方案 B：如果是原始二進位結構體 (例如 ESP32 Wi-Fi CSI 原始位元組)
+                // 你可以使用下面的方式獲取長度或特定 Byte 陣列
+                const dataLength = rawSensorData.byteLength;
+
+                // 更新畫面日誌 (這裡展示二進位長度與前幾位字節)
+                const hexPreview = Array.from(rawSensorData.slice(0, 8))
+                                        .map(b => b.toString(16).padStart(2, '0'))
+                                        .join(' ');
+                
+                logMessage(`[收到 ${dataLength} Bytes] 預覽(Hex): ${hexPreview} | 文字: ${textData.trim()}`);
+            }
+        } catch (error) {
+            logMessage(`【錯誤】讀取數據流中斷: ${error.message}`);
+            updateStatus("disconnected", "連線異常中斷");
+            connectBtn.disabled = false;
+        }
+    }
+
+    function updateStatus(state, text) {
+        statusText.innerText = text;
+        statusDot.className = "status-dot"; // reset
+        if (state === "connected") statusDot.classList.add("connected");
+        if (state === "connecting") statusText.style.color = "#f39c12";
+        if (state === "connected") statusText.style.color = "#2ecc71";
+        if (state === "disconnected") statusText.style.color = "#e74c3c";
+    }
+
+    function logMessage(msg) {
+        const time = new Date().toLocaleTimeString();
+        dataLog.textContent = `[${time}] ${msg}\n` + dataLog.textContent;
+        // 限制顯示行數，防止網頁內存過大卡死
+        const lines = dataLog.textContent.split('\n');
+        if (lines.length > 50) {
+            dataLog.textContent = lines.slice(0, 50).join('\n');
+        }
+    }
+
+    connectBtn.addEventListener('click', initWebTransport);
+</script>
+</body>
+</html>
